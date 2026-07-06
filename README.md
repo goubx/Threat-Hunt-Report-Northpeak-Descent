@@ -266,19 +266,99 @@ status.sync-northpeak.com, updates.sync-northpeak.com, cdn.sync-northpeak.com; h
 
 **Flag 12: Encoded Beacon Decode**
 
+HUNT LEAD: "One of those beacons was deliberately wrapped to hide where it was calling. Unwrap it and give me the full address, every parameter on the end."
+
 [Flag 12]
 
 ```kql
+DeviceProcessEvents
+| where DeviceName has_any ("npt-ws01","npt-srv01","npt-linux01")
+| where ProcessCommandLine has "EncodedCommand" or ProcessCommandLine has "-enc"
+| project Timestamp, DeviceName, ProcessCommandLine
+| order by Timestamp asc
+```
+
+Attacker used PowerShell's `-EncodedCommand` to hide a beacon call from npt-ws01 to `cdn.sync-northpeak.com/api/beacon`, unlike the plain-text checkin/status calls elsewhere. Decoding the base64 blob reveals the full URL: `https://cdn.sync-northpeak.com/api/beacon?id=NPT-WS01&flag=NORTHPEAK-09`, confirming `cdn.sync-northpeak.com` served double duty as both the exfil endpoint and a generic beacon channel.
+
+https://cdn.sync-northpeak.com/api/beacon?id=NPT-WS01&flag=NORTHPEAK-09
 
 
-**Flag 13:**
+**Flag 13:Encoded-Command Discrimination**
+
+HUNT LEAD: "Pull every wrapped command and most of them are innocent system chatter, not the operator. Name what's generating that chatter, and prove to me you can tell it apart from the few that matter."
+
+[Flag 13]
+
+```kql
+DeviceProcessEvents
+| where DeviceName has_any ("npt-ws01","npt-srv01","npt-linux01")
+| where ProcessCommandLine has "EncodedCommand"
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, ProcessCommandLine
+| order by Timestamp asc
+```
+The bulk of -EncodedCommand PowerShell calls across the estate trace back to gc_worker.exe, a legitimate system process generating routine encoded chatter unrelated to the operator. Filtering out gc_worker.exe as the initiating process isolates the handful of encoded calls launched directly by powershell.exe under the sancadmin session, including the wrapped C2 beacon to cdn.sync-northpeak.com, confirming those as the operator's actual activity.
+
+gc_worker.exe
+
+**Flag 14:Beacon Rhythm**
+
+HUNT LEAD: "Look at the spacing between the early check-ins to the first domain. Don't give me a number. Tell me what that rhythm proves about what's driving the channel."
+
+The two status.sync-northpeak.com checkins landed at 11:15:47 PM and 11:16:25 PM, roughly 38 seconds apart, a consistent, evenly-spaced interval rather than the irregular gaps you'd expect from someone manually retyping a command. That kind of fixed-interval beaconing is the signature of an automated loop or sleep timer driving the channel, not a human triggering each call by hand.
+
+fixed-interval beaconing, indicates an automated/scripted loop (not manual, hands-on-keyboard activity) driving the C2 channel
+
 
 ### Stage 05 — Impact & Judgement
 
-**Flag 15:**
-**Flag 16:**
-**Flag 17:**
-**Flag 18:**
+
+**Flag 15:Crown Jewel Exfil**
+
+[Flag 15]
+
+HUNT LEAD: "Last thing they did was take the crown jewels out. Name the file, the host it left from, and where it went."
+
+```kql
+DeviceProcessEvents
+| where DeviceName == "npt-srv01"
+| where ProcessCommandLine has "cdn.sync-northpeak.com"
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine
+| order by Timestamp asc
+```
+Attacker exfiltrated customer_data_export_20260616.csv from npt-srv01, uploading it via PowerShell Invoke-WebRequest to cdn.sync-northpeak.com/api/upload. This is the same subdomain that carried the wrapped beacon call, confirming cdn.sync-northpeak.com served as the operator's dedicated exfiltration and C2 channel for the intrusion.
+
+customer_data_export_20260616.csv, npt-srv01, cdn.sync-northpeak.com
+
+**Flag 16:Exfil Session Correlation**
+
+[Flag 16]
+
+HUNT LEAD: "That export went out while they were live in a remote session on the server, and there were two sessions. Tell me which one they were in when they did it: the first, or the one they came back through."
+
+```kql
+DeviceLogonEvents
+| where DeviceName == "npt-srv01"
+| where AccountName == "sancadmin"
+| where LogonType == "RemoteInteractive"
+| where ActionType == "LogonSuccess"
+| project Timestamp, LogonType, ActionType, RemoteIP, LogonId
+| order by Timestamp asc
+```
+
+Two RemoteInteractive sessions opened on npt-srv01 under sancadmin: the first at 9:58:08 PM and a second at 11:42:52 PM, both from the same external IP 148.64.103.173. The customer data export at 11:44:08 PM fell inside the second session, roughly 76 seconds after the operator reconnected, confirming the exfiltration was carried out during the return session rather than the initial foothold.
+
+second
+
+**Flag 17:Holding the Ground**
+
+[Flag 17]
+
+HUNT LEAD: "Here's what should bother you. They were hands-on for hours and nothing tripped. Check whether they tore the defences down to manage that. They didn't. So tell me the model, what let them operate this freely without going near the security stack."
+
+The operator ran the entire intrusion without disabling, bypassing, or tampering with any security tooling, and without dropping a single attacker-supplied binary on any host. Every action, RDP logons, PowerShell execution, registry persistence, HTTPS beacons and exfiltration, was carried out using native Windows tooling under the valid sancadmin administrator account. This is a Living off the Land model: legitimate credentials plus built-in binaries let the operator blend fully into normal admin activity, so the security stack had nothing anomalous to catch.
+
+no tampering no drops, living off the land
+
 
 *(Each flag: screenshot, KQL used, finding.)*
 
